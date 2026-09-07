@@ -1,0 +1,23 @@
+#!/usr/bin/env ruby
+$LOAD_PATH.unshift File.expand_path("../lib", __dir__)
+require "ruby_bible"
+
+opts = { once: false, keys: nil }
+ARGV.each do |arg|
+  case arg
+  when "--once" then opts[:once] = true
+  when /\A--keys=/m then opts[:keys] = arg.delete_prefix("--keys=")
+  when "--help", "-h"
+    puts <<~TXT
+      ruby-bible v#{RubyBible::VERSION} — browse Ruby's objects, methods, source and docs.
+
+      Usage: ruby-bible [--once] [--keys=jjlq]
+
+      --once        render one frame and exit (debug)
+      --keys=...    feed a scripted key sequence (debug)
+    TXT
+    exit 0
+  end
+end
+
+RubyBible::App.new(opts).run
