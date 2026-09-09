@@ -808,6 +808,7 @@ module RubyBible
     # ---- main loop ------------------------------------------------------------
 
     def run
+      win_term_setup
       if @stdin.tty?
         @stdin.raw do
           @stdin.echo = false
@@ -818,11 +819,41 @@ module RubyBible
       end
     ensure
       @stdout.write("\e[0m\e[?25h\e[?1049l\e[2J\e[H")
+      win_term_restore
+    end
+
+    def win_term_setup
+      return unless Gem.win_platform?
+      require "fiddle"
+      handle_type = Fiddle.const_defined?(:TYPE_INTPTR_T) ? Fiddle::TYPE_INTPTR_T : Fiddle::TYPE_VOIDP
+      k32 = Fiddle.dlopen("kernel32.dll")
+      out = Fiddle::Function.new(k32["GetStdHandle"], [handle_type], Fiddle::TYPE_VOIDP).call(-11)
+      mode = Fiddle::Pointer.malloc(4)
+      get_mode = Fiddle::Function.new(k32["GetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP], Fiddle::TYPE_LONG)
+      return unless out && get_mode.call(out, mode) == 1
+      @saved_mode = mode[0, 4].unpack1("L")
+      Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
+                      .call(out, @saved_mode | 0x0004)
+      @saved_cp = Fiddle::Function.new(k32["GetConsoleOutputCP"], [], Fiddle::TYPE_LONG).call
+      Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(65001)
+    rescue StandardError, LoadError
+      nil
+    end
+
+    def win_term_restore
+      return unless @saved_mode
+      require "fiddle"
+      k32 = Fiddle.dlopen("kernel32.dll")
+      Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
+                      .call(@win_out, @saved_mode)
+      Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(@saved_cp) if @saved_cp
+    rescue StandardError, LoadError
+      nil
     end
 
     def inner_run
       @stdout.write("\e[?1049h\e[?25l\e[2J")
-      trap("WINCH") { update_geometry; @dirty = true }
+      trap("WINCH") { update_geometry; @dirty = true } if Signal.list.key?("WINCH")
       if @once
         wait_docs(2.0)
         render
@@ -860,6 +891,9 @@ module RubyBible
         when :eof
           @running = false
         when nil
+          old = [@height, @width]
+          update_geometry
+          @dirty = true if old != [@height, @width]
           d = doc
           if d && d[:ready] && seen_doc_key != d[:key]
             seen_doc_key = d[:key]
@@ -899,9 +933,13 @@ module RubyBible
     def initialize(io)
       @io = io
       @pending = []
+      @chunks = []
+      @mutex = Mutex.new
+      @reader = Thread.new { reader_loop } if Gem.win_platform?
     end
 
     def next_key(timeout)
+      return next_key_threaded(timeout) if @reader
       loop do
         return @pending.shift if @pending.any?
         r = IO.select([@io], nil, nil, timeout)
@@ -910,6 +948,73 @@ module RubyBible
         return :eof if chunk.nil?
         return nil if chunk == :wait_readable || chunk.empty?
         parse_chunk(chunk)
+      end
+    end
+
+    def reader_loop
+      loop do
+        chunk = @io.readpartial(4096)
+        break if chunk.nil?
+        @mutex.synchronize { @chunks << chunk }
+      end
+    rescue StandardError
+      nil
+    end
+
+    def next_key_threaded(timeout)
+      deadline = Time.now + timeout
+      loop do
+        return @pending.shift if @pending.any?
+        if (buf = drain_chunks)
+          parse_threaded(buf)
+          next
+        end
+        return :eof if !@reader.alive? && @pending.empty?
+        return nil if Time.now >= deadline
+        sleep 0.005
+      end
+    end
+
+    def drain_chunks
+      @mutex.synchronize do
+        if @chunks.empty?
+          nil
+        else
+          s = @chunks.join
+          @chunks.clear
+          s
+        end
+      end
+    end
+
+    def parse_threaded(chunk)
+      buf = chunk
+      until buf.empty?
+        if buf.start_with?("\e")
+          seq = SEQ.keys.find { |s| buf.start_with?(s) }
+          if seq
+            @pending << SEQ[seq]
+            buf = buf[seq.length..]
+          elsif buf.length < 4 && SEQ.keys.any? { |s| s.start_with?(buf) }
+            more = drain_chunks
+            unless more
+              sleep 0.01
+              more = drain_chunks
+            end
+            if more
+              buf << more
+            else
+              @pending << :esc
+              buf = buf[1..]
+            end
+          else
+            @pending << :esc
+            buf = buf[1..]
+          end
+        else
+          @pending << self.class.parse_char(buf[0])
+          buf = buf[1..]
+        end
       end
     end
 

@@ -1,5 +1,10 @@
 # ruby-bible
 
+> **Vibe-coded.** This project was written with heavy AI assistance
+> ("vibe coding"). It works and is kept intentionally dependency-free, but
+> treat it as a fun experiment rather than production-hardened code — the
+> original author is the LLM, and nobody has fully reviewed it.
+
 A yazi-style terminal UI for browsing **Ruby itself**: every loaded class,
 module and singleton object, their methods, the *actual source code* of
 Ruby-defined methods, and the official documentation, usage notes and
@@ -58,6 +63,9 @@ j/k move · ↵/l open · / filter · ? help · q quit
 ## Requirements
 
 - Ruby ≥ 3.1 (uses `io/console`, `RubyVM::AbstractSyntaxTree` fallbacks).
+- Runs on **Linux and Windows** (Windows 10+ in Windows Terminal or any
+  VT-capable console). On Windows it auto-enables VT output and UTF-8 and
+  falls back to a threaded input reader, so the Unix fast path is unchanged.
 - `ri` with a documentation database. Gem docs are installed by default;
   **core docs** (String, Array, Module, …) are a separate package on some
   distros:
@@ -73,7 +81,8 @@ j/k move · ↵/l open · / filter · ? help · q quit
 ## Running
 
 ```sh
-bin/ruby-bible
+bin/ruby-bible            # Linux / macOS
+ruby bin\ruby-bible       # Windows
 ```
 
 No gems needed — pure Ruby stdlib.
