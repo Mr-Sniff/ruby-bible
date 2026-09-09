@@ -156,21 +156,25 @@ module RubyBible
     private
 
     def border_color(focused)
-      focused ? "\e[36m" : "\e[90m"
+      focused ? "\e[96m" : "\e[90m"
     end
 
     def pane_top(w, title, focused)
       t = "─ #{title} "
-      rest = w - Ansi.visible_len(t) - 2 # ┌ + t + ──… + ┐ = w
-      "#{border_color(focused)}┌#{Ansi.paint(t, focused ? :bcyan : :cyan, BOLD)}#{'─' * [rest, 0].max}┐#{RESET}"
+      rest = w - Ansi.visible_len(t) - 2
+      if focused
+        "\e[96m┌\e[46m\e[30m#{t}\e[0m\e[96m" + ("─" * [rest, 0].max) + "┐\e[0m"
+      else
+        "\e[90m┌#{Ansi.paint(t, :cyan)}#{'─' * [rest, 0].max}┐\e[0m"
+      end
     end
 
-    def pane_row(w, text)
-      "#{Ansi.pad(text || "", w - 1)}\e[90m│\e[0m"
+    def pane_row(w, text, focused = false)
+      "#{Ansi.pad(text || "", w - 1)}#{focused ? "\e[96m" : "\e[90m"}│\e[0m"
     end
 
-    def pane_blank_row(w)
-      "#{Ansi.pad("", w - 1)}\e[90m│\e[0m"
+    def pane_blank_row(w, focused = false)
+      "#{Ansi.pad("", w - 1)}#{focused ? "\e[96m" : "\e[90m"}│\e[0m"
     end
 
     def pane_bottom(w, focused)
@@ -178,27 +182,40 @@ module RubyBible
     end
 
     # Returns exactly `h` lines for a list pane.
+    # The cursor rests in a free middle band and the list scrolls only once
+    # the cursor presses into the top or bottom margin.
     def build_list(w, h, title, focused, lines, cursor, suffix)
       rows = [pane_top(w, title + suffix, focused)]
       content_h = h - 2
       if lines.empty?
-        content_h.times { rows << pane_blank_row(w) }
+        content_h.times { rows << pane_blank_row(w, focused) }
       else
         off = 0
-        if cursor
-          off = cursor - content_h + 1 if cursor >= off + content_h
-          off = cursor if cursor < off
-        end
+        off = scroll_offset(lines.size, content_h, cursor) if cursor
         visible = lines[off, content_h] || []
         visible.each_with_index do |line, i|
           idx = off + i
           line = Ansi.paint(line, REVERSE) if cursor && idx == cursor
-          rows << pane_row(w, line)
+          rows << pane_row(w, line, focused)
         end
-        (content_h - visible.size).times { rows << pane_blank_row(w) }
+        (content_h - visible.size).times { rows << pane_blank_row(w, focused) }
       end
       rows << pane_bottom(w, focused)
       rows
+    end
+
+    # Window offset so the cursor stays centred in the pane whenever the list
+    # is long enough, and drifts out to the top/bottom edge only near the ends.
+    def scroll_offset(total, content_h, cursor, _margin = nil)
+      return 0 if total <= content_h
+      half = content_h / 2
+      if cursor < half
+        0
+      elsif cursor >= total - (content_h - half)
+        total - content_h
+      else
+        cursor - half
+      end
     end
 
     def build_left(w, h)
@@ -226,8 +243,8 @@ module RubyBible
       end
       rows = [pane_top(w, title, a.focus == :preview)]
       slice = lines[a.preview_scroll, content_h] || []
-      slice.each { |l| rows << pane_row(w, l) }
-      (content_h - slice.size).times { rows << pane_blank_row(w) }
+      slice.each { |l| rows << pane_row(w, l, a.focus == :preview) }
+      (content_h - slice.size).times { rows << pane_blank_row(w, a.focus == :preview) }
       rows << pane_bottom(w, a.focus == :preview)
       rows
     end
@@ -239,7 +256,7 @@ module RubyBible
         ["h", "collapse / go left"],
         ["1 2 3", "jump to Objects / Methods / Preview"],
         ["Tab / Shift-Tab", "cycle panes"],
-        ["/", "filter current pane (Esc clears)"],
+        ["/", "filter current pane (again to clear)"],
         ["a", "toggle inherited methods"],
         ["d / s", "jump to docs / source (preview)"],
         ["g / G", "top / end"],

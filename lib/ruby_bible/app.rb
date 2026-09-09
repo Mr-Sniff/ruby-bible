@@ -520,9 +520,9 @@ module RubyBible
       hints =
         case @focus
         when :objects
-          "j/k move · ↵/l open · h collapse · / filter · 1/2/3 panes · ? help · q quit"
+          "j/k move · ↵/l open · h collapse · / filter/clear · 1/2/3 panes · ? help · q quit"
         when :methods
-          "j/k move · ↵/l preview · a inherited:#{@show_inherited ? "on" : "off"} · / filter · ? help · q quit"
+          "j/k move · ↵/l preview · a inherited:#{@show_inherited ? "on" : "off"} · / filter/clear · ? help · q quit"
         else
           "j/k scroll · d docs · s source · g/G top/end · h back · ? help · q quit"
         end
@@ -559,7 +559,7 @@ module RubyBible
       when "l", :right
         move_right
       when "/"
-        start_search
+        toggle_search
       when :esc
         clear_filters
       when :up, "k"
@@ -737,6 +737,39 @@ module RubyBible
       @dirty = true
     end
 
+    def toggle_search
+      if @search_active
+        cancel_search
+      elsif @focus == :methods && @methods_filter
+        clear_methods_filter
+      elsif @focus == :objects && @objects_filter
+        clear_objects_filter
+      else
+        start_search
+      end
+    end
+
+    def clear_objects_filter
+      return unless @objects_filter
+      keep = selected_entry&.label
+      @objects_filter = nil
+      refresh_objects
+      idx = @objects_rows.index { |r| r[:type] == :entry && r[:entry].label == keep }
+      @objects_cursor = idx || @objects_cursor
+      entry = selected_entry
+      select_target(entry&.target) if entry&.target != @target
+      @dirty = true
+    end
+
+    def clear_methods_filter
+      return unless @methods_filter
+      @methods_filter = nil
+      rebuild_methods(selected_method&.name)
+      @preview_key = nil
+      request_doc
+      @dirty = true
+    end
+
     def handle_search_key(k)
       case k
       when :esc
@@ -797,8 +830,11 @@ module RubyBible
     end
 
     def clear_filters
-      return if @objects_filter.nil? && @methods_filter.nil?
-      cancel_search
+      return if @objects_filter.nil? && @methods_filter.nil? && !@search_active
+      @search_active = false
+      clear_objects_filter
+      clear_methods_filter
+      @dirty = true
     end
 
     def search_active = @search_active
@@ -827,25 +863,41 @@ module RubyBible
       require "fiddle"
       handle_type = Fiddle.const_defined?(:TYPE_INTPTR_T) ? Fiddle::TYPE_INTPTR_T : Fiddle::TYPE_VOIDP
       k32 = Fiddle.dlopen("kernel32.dll")
-      out = Fiddle::Function.new(k32["GetStdHandle"], [handle_type], Fiddle::TYPE_VOIDP).call(-11)
-      mode = Fiddle::Pointer.malloc(4)
+      get_std = Fiddle::Function.new(k32["GetStdHandle"], [handle_type], Fiddle::TYPE_VOIDP)
       get_mode = Fiddle::Function.new(k32["GetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP], Fiddle::TYPE_LONG)
-      return unless out && get_mode.call(out, mode) == 1
-      @saved_mode = mode[0, 4].unpack1("L")
-      Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
-                      .call(out, @saved_mode | 0x0004)
-      @saved_cp = Fiddle::Function.new(k32["GetConsoleOutputCP"], [], Fiddle::TYPE_LONG).call
-      Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(65001)
+      set_mode = Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
+      mode = Fiddle::Pointer.malloc(4)
+      @win_out = get_std.call(-11)
+      out_mode =
+        if @win_out && get_mode.call(@win_out, mode) == 1
+          mode[0, 4].unpack1("L")
+        end
+      @win_in = get_std.call(-10)
+      in_mode =
+        if @win_in && get_mode.call(@win_in, mode) == 1
+          mode[0, 4].unpack1("L")
+        end
+      @saved_mode = out_mode
+      if out_mode
+        set_mode.call(@win_out, out_mode | 0x0004)
+        @saved_cp = Fiddle::Function.new(k32["GetConsoleOutputCP"], [], Fiddle::TYPE_LONG).call
+        Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(65001)
+      end
+      if in_mode
+        @saved_in_mode = in_mode
+        set_mode.call(@win_in, in_mode | 0x0200)
+      end
     rescue StandardError, LoadError
       nil
     end
 
     def win_term_restore
-      return unless @saved_mode
+      return unless Gem.win_platform?
       require "fiddle"
       k32 = Fiddle.dlopen("kernel32.dll")
-      Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
-                      .call(@win_out, @saved_mode)
+      set_mode = Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
+      set_mode.call(@win_out, @saved_mode) if @win_out && @saved_mode
+      set_mode.call(@win_in, @saved_in_mode) if @win_in && @saved_in_mode
       Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(@saved_cp) if @saved_cp
     rescue StandardError, LoadError
       nil
@@ -953,7 +1005,12 @@ module RubyBible
 
     def reader_loop
       loop do
-        chunk = @io.readpartial(4096)
+        chunk =
+          if Gem.win_platform? && @io.respond_to?(:getch)
+            @io.getch
+          else
+            @io.readpartial(4096)
+          end
         break if chunk.nil?
         @mutex.synchronize { @chunks << chunk }
       end
