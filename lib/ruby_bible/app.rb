@@ -982,6 +982,14 @@ module RubyBible
       "\e[Z" => :stab,
     }.freeze
 
+    # Windows console delivers arrow/nav keys as a 0x00 or 0xE0 prefix byte
+    # followed by a scan code (not ANSI escape sequences).
+    SCAN = {
+      0x48 => :up, 0x50 => :down, 0x4B => :left, 0x4D => :right,
+      0x49 => :pgup, 0x51 => :pgdn, 0x47 => :home, 0x4F => :end,
+      0x53 => :del,
+    }.freeze
+
     def initialize(io)
       @io = io
       @pending = []
@@ -1045,67 +1053,97 @@ module RubyBible
     end
 
     def parse_threaded(chunk)
-      buf = chunk
+      buf = chunk.b
       until buf.empty?
-        if buf.start_with?("\e")
-          seq = SEQ.keys.find { |s| buf.start_with?(s) }
+        if buf.start_with?("\x00".b, "\xE0".b)
+          scan = buf.getbyte(1)
+          if scan && (sym = SCAN[scan])
+            @pending << sym
+            buf = buf.byteslice(2, buf.bytesize - 2) || ""
+          elsif scan.nil? && buf.bytesize < 2
+            more = drain_chunks
+            unless more
+              sleep 0.01
+              more = drain_chunks
+            end
+            more ? buf = (buf + more).b : buf = buf.byteslice(1, buf.bytesize - 1) || ""
+          else
+            buf = buf.byteslice(1, buf.bytesize - 1) || ""
+          end
+        elsif buf.start_with?("\e".b)
+          seq = SEQ.keys.find { |s| buf.start_with?(s.b) }
           if seq
             @pending << SEQ[seq]
-            buf = buf[seq.length..]
-          elsif buf.length < 4 && SEQ.keys.any? { |s| s.start_with?(buf) }
+            buf = buf.byteslice(seq.bytesize, buf.bytesize - seq.bytesize) || ""
+          elsif buf.bytesize < 4 && SEQ.keys.any? { |s| s.b.start_with?(buf) }
             more = drain_chunks
             unless more
               sleep 0.01
               more = drain_chunks
             end
             if more
-              buf << more
+              buf = (buf + more).b
             else
               @pending << :esc
-              buf = buf[1..]
+              buf = buf.byteslice(1, buf.bytesize - 1) || ""
             end
           else
             @pending << :esc
-            buf = buf[1..]
+            buf = buf.byteslice(1, buf.bytesize - 1) || ""
           end
         else
-          @pending << self.class.parse_char(buf[0])
-          buf = buf[1..]
+          c = buf.byteslice(0, 1)
+          @pending << self.class.parse_char(c.force_encoding(Encoding::UTF_8))
+          buf = buf.byteslice(1, buf.bytesize - 1) || ""
         end
       end
     end
 
     def parse_chunk(chunk)
-      buf = chunk
+      buf = chunk.b
       until buf.empty?
-        if buf.start_with?("\e")
-          seq = SEQ.keys.find { |s| buf.start_with?(s) }
+        if buf.start_with?("\x00".b, "\xE0".b)
+          scan = buf.getbyte(1)
+          if scan && (sym = SCAN[scan])
+            @pending << sym
+            buf = buf.byteslice(2, buf.bytesize - 2) || ""
+          elsif scan.nil? && buf.bytesize < 2 && @io.respond_to?(:wait_readable) && @io.wait_readable(0.02)
+            buf = (buf + @io.read_nonblock(1, exception: false).to_s).b
+          else
+            buf = buf.byteslice(1, buf.bytesize - 1) || ""
+          end
+        elsif buf.start_with?("\e".b)
+          seq = SEQ.keys.find { |s| buf.start_with?(s.b) }
           if seq
             @pending << SEQ[seq]
-            buf = buf[seq.length..]
-          elsif buf.length < 4 && SEQ.keys.any? { |s| s.start_with?(buf) }
+            buf = buf.byteslice(seq.bytesize, buf.bytesize - seq.bytesize) || ""
+          elsif buf.bytesize < 4 && SEQ.keys.any? { |s| s.b.start_with?(buf) }
             more = nil
-            if @io.wait_readable(0.02)
+            if @io.respond_to?(:wait_readable) && @io.wait_readable(0.02)
               more = @io.read_nonblock(64, exception: false)
             end
             if more.is_a?(String) && !more.empty?
-              buf << more
+              buf = (buf + more).b
             else
               @pending << :esc
-              buf = buf[1..]
+              buf = buf.byteslice(1, buf.bytesize - 1) || ""
             end
           else
             @pending << :esc
-            buf = buf[1..]
+            buf = buf.byteslice(1, buf.bytesize - 1) || ""
           end
         else
-          @pending << self.class.parse_char(buf[0])
-          buf = buf[1..]
+          c = buf.byteslice(0, 1)
+          @pending << self.class.parse_char(c.force_encoding(Encoding::UTF_8))
+          buf = buf.byteslice(1, buf.bytesize - 1) || ""
         end
       end
     end
 
     def self.parse_char(ch)
+      if ch.encoding != Encoding::UTF_8
+        ch = ch.dup.force_encoding(Encoding::UTF_8)
+      end
       case ch
       when "\r", "\n" then :enter
       when "\t" then :tab
