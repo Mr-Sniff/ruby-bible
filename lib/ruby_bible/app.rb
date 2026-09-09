@@ -589,6 +589,72 @@ module RubyBible
       end
     end
 
+    # ---- mouse ----------------------------------------------------------------
+    # event: [:mouse, button, col, row, press]; col/row are 1-based terminal
+    # coordinates (SGR 1006).
+    def handle_mouse(button, col, row, press)
+      return unless press || button == 64 || button == 65
+      w1, w2, w3 = Screen.new(self).columns(@width)
+      pane =
+        if col <= w1 then :objects
+        elsif col <= w1 + w2 then :methods
+        else :preview
+        end
+
+      case button
+      when 64
+        mouse_wheel(-1, pane)
+      when 65
+        mouse_wheel(1, pane)
+      when 0
+        mouse_click(col, row, pane)
+      end
+    end
+
+    def mouse_wheel(dir, pane)
+      @focus = pane unless @help_visible
+      if pane == :preview
+        scroll(dir * 3)
+      else
+        @focus = pane
+        move_cursor(dir * 3)
+      end
+    end
+
+    def mouse_click(col, row, pane)
+      return if @help_visible
+      @focus = pane
+      body_row = row - 2
+      return if body_row < 0
+      content_h = content_height
+      content_idx = body_row - 1
+      return if content_idx < 0 || content_idx >= content_h
+      case pane
+      when :objects
+        off = Screen.scroll_offset(@objects_rows.size, content_h, @objects_cursor)
+        idx = off + content_idx
+        return if idx >= @objects_rows.size
+        r = @objects_rows[idx]
+        if r[:type] == :group
+          @objects_cursor = idx
+          toggle_group(r[:group])
+        elsif r[:type] == :entry
+          @objects_cursor = idx
+          select_target(r[:entry].target)
+        end
+        @dirty = true
+      when :methods
+        off = Screen.scroll_offset(@method_rows.size, content_h, @methods_cursor)
+        idx = off + content_idx
+        return if idx >= @method_rows.size
+        r = @method_rows[idx]
+        @methods_cursor = idx
+        @dirty = true
+      when :preview
+        scroll(body_row - 1)
+      end
+    end
+
     def cycle_focus(dir)
       i = FOCUSES.index(@focus)
       @focus = FOCUSES[(i + dir) % FOCUSES.size]
@@ -844,67 +910,24 @@ module RubyBible
     # ---- main loop ------------------------------------------------------------
 
     def run
-      win_term_setup
+      Terminal.setup
       if @stdin.tty?
         @stdin.raw do
           @stdin.echo = false
+          Terminal.enable_vt_input
           inner_run
         end
       else
         inner_run
       end
     ensure
-      @stdout.write("\e[0m\e[?25h\e[?1049l\e[2J\e[H")
-      win_term_restore
-    end
-
-    def win_term_setup
-      return unless Gem.win_platform?
-      require "fiddle"
-      handle_type = Fiddle.const_defined?(:TYPE_INTPTR_T) ? Fiddle::TYPE_INTPTR_T : Fiddle::TYPE_VOIDP
-      k32 = Fiddle.dlopen("kernel32.dll")
-      get_std = Fiddle::Function.new(k32["GetStdHandle"], [handle_type], Fiddle::TYPE_VOIDP)
-      get_mode = Fiddle::Function.new(k32["GetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_VOIDP], Fiddle::TYPE_LONG)
-      set_mode = Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
-      mode = Fiddle::Pointer.malloc(4)
-      @win_out = get_std.call(-11)
-      out_mode =
-        if @win_out && get_mode.call(@win_out, mode) == 1
-          mode[0, 4].unpack1("L")
-        end
-      @win_in = get_std.call(-10)
-      in_mode =
-        if @win_in && get_mode.call(@win_in, mode) == 1
-          mode[0, 4].unpack1("L")
-        end
-      @saved_mode = out_mode
-      if out_mode
-        set_mode.call(@win_out, out_mode | 0x0004)
-        @saved_cp = Fiddle::Function.new(k32["GetConsoleOutputCP"], [], Fiddle::TYPE_LONG).call
-        Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(65001)
-      end
-      if in_mode
-        @saved_in_mode = in_mode
-        set_mode.call(@win_in, in_mode | 0x0200)
-      end
-    rescue StandardError, LoadError
-      nil
-    end
-
-    def win_term_restore
-      return unless Gem.win_platform?
-      require "fiddle"
-      k32 = Fiddle.dlopen("kernel32.dll")
-      set_mode = Fiddle::Function.new(k32["SetConsoleMode"], [Fiddle::TYPE_VOIDP, Fiddle::TYPE_LONG], Fiddle::TYPE_LONG)
-      set_mode.call(@win_out, @saved_mode) if @win_out && @saved_mode
-      set_mode.call(@win_in, @saved_in_mode) if @win_in && @saved_in_mode
-      Fiddle::Function.new(k32["SetConsoleOutputCP"], [Fiddle::TYPE_LONG], Fiddle::TYPE_LONG).call(@saved_cp) if @saved_cp
-    rescue StandardError, LoadError
-      nil
+      @stdout.write("\e[0m\e[?25h#{Input::MOUSE_DISABLE}\e[?1049l\e[2J\e[H")
+      Terminal.restore
     end
 
     def inner_run
       @stdout.write("\e[?1049h\e[?25l\e[2J")
+      @stdout.write(Input::MOUSE_ENABLE) unless @once || @key_source
       trap("WINCH") { update_geometry; @dirty = true } if Signal.list.key?("WINCH")
       if @once
         wait_docs(2.0)
@@ -953,7 +976,11 @@ module RubyBible
           end
         else
           seen_doc_key = nil
-          handle_key(k)
+          if k.is_a?(Array) && k[0] == :mouse
+            handle_mouse(*k[1, 4])
+          else
+            handle_key(k)
+          end
         end
       end
     end
@@ -969,194 +996,6 @@ module RubyBible
       @stdout.write("\e[H#{clear}" + frame)
       @stdout.flush
       @dirty = false
-    end
-  end
-
-  # Reads keys from a raw tty, mapping escape sequences to symbols.
-  class Input
-    SEQ = {
-      "\e[A" => :up, "\e[B" => :down, "\e[C" => :right, "\e[D" => :left,
-      "\eOA" => :up, "\eOB" => :down, "\eOC" => :right, "\eOD" => :left,
-      "\e[H" => :home, "\e[F" => :end, "\e[1~" => :home, "\e[4~" => :end,
-      "\e[5~" => :pgup, "\e[6~" => :pgdn, "\e[3~" => :del,
-      "\e[Z" => :stab,
-    }.freeze
-
-    # Windows console delivers arrow/nav keys as a 0x00 or 0xE0 prefix byte
-    # followed by a scan code (not ANSI escape sequences).
-    SCAN = {
-      0x48 => :up, 0x50 => :down, 0x4B => :left, 0x4D => :right,
-      0x49 => :pgup, 0x51 => :pgdn, 0x47 => :home, 0x4F => :end,
-      0x53 => :del,
-    }.freeze
-
-    def initialize(io)
-      @io = io
-      @pending = []
-      @chunks = []
-      @mutex = Mutex.new
-      @reader = Thread.new { reader_loop } if Gem.win_platform?
-    end
-
-    def next_key(timeout)
-      return next_key_threaded(timeout) if @reader
-      loop do
-        return @pending.shift if @pending.any?
-        r = IO.select([@io], nil, nil, timeout)
-        return nil unless r
-        chunk = @io.read_nonblock(4096, exception: false)
-        return :eof if chunk.nil?
-        return nil if chunk == :wait_readable || chunk.empty?
-        parse_chunk(chunk)
-      end
-    end
-
-    def reader_loop
-      loop do
-        chunk =
-          if Gem.win_platform? && @io.respond_to?(:getch)
-            @io.getch
-          else
-            @io.readpartial(4096)
-          end
-        break if chunk.nil?
-        @mutex.synchronize { @chunks << chunk }
-      end
-    rescue StandardError
-      nil
-    end
-
-    def next_key_threaded(timeout)
-      deadline = Time.now + timeout
-      loop do
-        return @pending.shift if @pending.any?
-        if (buf = drain_chunks)
-          parse_threaded(buf)
-          next
-        end
-        return :eof if !@reader.alive? && @pending.empty?
-        return nil if Time.now >= deadline
-        sleep 0.005
-      end
-    end
-
-    def drain_chunks
-      @mutex.synchronize do
-        if @chunks.empty?
-          nil
-        else
-          s = @chunks.join
-          @chunks.clear
-          s
-        end
-      end
-    end
-
-    def parse_threaded(chunk)
-      buf = chunk.b
-      until buf.empty?
-        if buf.start_with?("\x00".b, "\xE0".b)
-          scan = buf.getbyte(1)
-          if scan && (sym = SCAN[scan])
-            @pending << sym
-            buf = buf.byteslice(2, buf.bytesize - 2) || ""
-          elsif scan.nil? && buf.bytesize < 2
-            more = drain_chunks
-            unless more
-              sleep 0.01
-              more = drain_chunks
-            end
-            more ? buf = (buf + more).b : buf = buf.byteslice(1, buf.bytesize - 1) || ""
-          else
-            buf = buf.byteslice(1, buf.bytesize - 1) || ""
-          end
-        elsif buf.start_with?("\e".b)
-          seq = SEQ.keys.find { |s| buf.start_with?(s.b) }
-          if seq
-            @pending << SEQ[seq]
-            buf = buf.byteslice(seq.bytesize, buf.bytesize - seq.bytesize) || ""
-          elsif buf.bytesize < 4 && SEQ.keys.any? { |s| s.b.start_with?(buf) }
-            more = drain_chunks
-            unless more
-              sleep 0.01
-              more = drain_chunks
-            end
-            if more
-              buf = (buf + more).b
-            else
-              @pending << :esc
-              buf = buf.byteslice(1, buf.bytesize - 1) || ""
-            end
-          else
-            @pending << :esc
-            buf = buf.byteslice(1, buf.bytesize - 1) || ""
-          end
-        else
-          c = buf.byteslice(0, 1)
-          @pending << self.class.parse_char(c.force_encoding(Encoding::UTF_8))
-          buf = buf.byteslice(1, buf.bytesize - 1) || ""
-        end
-      end
-    end
-
-    def parse_chunk(chunk)
-      buf = chunk.b
-      until buf.empty?
-        if buf.start_with?("\x00".b, "\xE0".b)
-          scan = buf.getbyte(1)
-          if scan && (sym = SCAN[scan])
-            @pending << sym
-            buf = buf.byteslice(2, buf.bytesize - 2) || ""
-          elsif scan.nil? && buf.bytesize < 2 && @io.respond_to?(:wait_readable) && @io.wait_readable(0.02)
-            buf = (buf + @io.read_nonblock(1, exception: false).to_s).b
-          else
-            buf = buf.byteslice(1, buf.bytesize - 1) || ""
-          end
-        elsif buf.start_with?("\e".b)
-          seq = SEQ.keys.find { |s| buf.start_with?(s.b) }
-          if seq
-            @pending << SEQ[seq]
-            buf = buf.byteslice(seq.bytesize, buf.bytesize - seq.bytesize) || ""
-          elsif buf.bytesize < 4 && SEQ.keys.any? { |s| s.b.start_with?(buf) }
-            more = nil
-            if @io.respond_to?(:wait_readable) && @io.wait_readable(0.02)
-              more = @io.read_nonblock(64, exception: false)
-            end
-            if more.is_a?(String) && !more.empty?
-              buf = (buf + more).b
-            else
-              @pending << :esc
-              buf = buf.byteslice(1, buf.bytesize - 1) || ""
-            end
-          else
-            @pending << :esc
-            buf = buf.byteslice(1, buf.bytesize - 1) || ""
-          end
-        else
-          c = buf.byteslice(0, 1)
-          @pending << self.class.parse_char(c.force_encoding(Encoding::UTF_8))
-          buf = buf.byteslice(1, buf.bytesize - 1) || ""
-        end
-      end
-    end
-
-    def self.parse_char(ch)
-      if ch.encoding != Encoding::UTF_8
-        ch = ch.dup.force_encoding(Encoding::UTF_8)
-      end
-      case ch
-      when "\r", "\n" then :enter
-      when "\t" then :tab
-      when "\e" then :esc
-      when "\x7f", "\b" then :backspace
-      when "\x03" then :"C-c"
-      when "\x04" then :"C-d"
-      when "\x15" then :"C-u"
-      when "\x01" then :"C-a"
-      when "\x05" then :"C-e"
-      else
-        ch
-      end
     end
   end
 end

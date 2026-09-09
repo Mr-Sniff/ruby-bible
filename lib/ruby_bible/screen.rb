@@ -191,7 +191,7 @@ module RubyBible
         content_h.times { rows << pane_blank_row(w, focused) }
       else
         off = 0
-        off = scroll_offset(lines.size, content_h, cursor) if cursor
+        off = self.class.scroll_offset(lines.size, content_h, cursor) if cursor
         visible = lines[off, content_h] || []
         visible.each_with_index do |line, i|
           idx = off + i
@@ -206,7 +206,7 @@ module RubyBible
 
     # Window offset so the cursor stays centred in the pane whenever the list
     # is long enough, and drifts out to the top/bottom edge only near the ends.
-    def scroll_offset(total, content_h, cursor, _margin = nil)
+    def self.scroll_offset(total, content_h, cursor, _margin = nil)
       return 0 if total <= content_h
       half = content_h / 2
       if cursor < half
