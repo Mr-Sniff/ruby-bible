@@ -647,8 +647,11 @@ module RubyBible
         off = Screen.scroll_offset(@method_rows.size, content_h, @methods_cursor)
         idx = off + content_idx
         return if idx >= @method_rows.size
-        r = @method_rows[idx]
+        return if @method_rows[idx][:type] != :method
         @methods_cursor = idx
+        @preview_scroll = 0
+        @preview_key = nil
+        request_doc
         @dirty = true
       when :preview
         scroll(body_row - 1)
